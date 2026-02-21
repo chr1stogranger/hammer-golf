@@ -46,13 +46,67 @@ const PROPS=[
   {id:"low",name:"Low Score",icon:"👑",desc:"Lowest score wins"},
 ];
 
-const HOLES=Array.from({length:18},(_,i)=>({
+const DEFAULT_HOLES=Array.from({length:18},(_,i)=>({
   num:i+1,
   par:[4,5,3,4,4,3,5,4,4,4,3,5,4,4,3,4,5,4][i],
   yds:[405,542,178,388,432,165,518,375,410,392,195,530,415,368,152,445,555,430][i],
   hcp:[7,3,15,9,1,17,5,11,13,8,16,2,6,12,18,4,10,14][i],
   name:["Tea Olive","Pink Dogwood","Flowering Peach","Flowering Crab Apple","Magnolia","Juniper","Pampas","Yellow Jasmine","Carolina Cherry","Camellia","White Dogwood","Golden Bell","Azalea","Chinese Fir","Firethorn","Redbud","Nandina","Holly"][i],
 }));
+
+// Parse scorecard data from Golf Course API
+function parseCourseData(course) {
+  try {
+    const scorecard = typeof course.scorecard === "string" ? JSON.parse(course.scorecard) : course.scorecard;
+    if (!scorecard || !Array.isArray(scorecard) || scorecard.length === 0) return null;
+
+    // Find par row, handicap row, and tee rows
+    const parRow = scorecard.find(r => {
+      const label = r["Hole:"] || r["Hole"] || "";
+      return label.toLowerCase().includes("par");
+    });
+    const hcpRow = scorecard.find(r => {
+      const label = r["Hole:"] || r["Hole"] || "";
+      return label.toLowerCase().includes("handicap") || label.toLowerCase().includes("hcp");
+    });
+    const teeRows = scorecard.filter(r => {
+      const label = r["Hole:"] || r["Hole"] || "";
+      const lower = label.toLowerCase();
+      return !lower.includes("par") && !lower.includes("handicap") && !lower.includes("hcp") && label !== "";
+    });
+
+    if (!parRow) return null;
+
+    const numHoles = course.holes || 18;
+    const holes = [];
+    for (let i = 1; i <= numHoles; i++) {
+      const key = String(i);
+      holes.push({
+        num: i,
+        par: parseInt(parRow[key]) || 4,
+        yds: 0, // filled per tee selection
+        hcp: hcpRow ? (parseInt(hcpRow[key]) || i) : i,
+        name: "Hole " + i,
+      });
+    }
+
+    // Extract tee options with yardages per hole
+    const tees = teeRows.map(row => {
+      const label = (row["Hole:"] || row["Hole"] || "Unknown").replace(":", "").trim();
+      const yardages = [];
+      for (let i = 1; i <= numHoles; i++) {
+        yardages.push(parseInt(row[String(i)]) || 0);
+      }
+      const total = yardages.reduce((a, b) => a + b, 0);
+      return { name: label, yardages, total };
+    }).filter(t => t.total > 0); // only tees with actual yardage data
+
+    return { holes, tees, numHoles, name: course.courseName || course.name || "Unknown Course" };
+  } catch (e) {
+    console.error("Failed to parse course data:", e);
+    return null;
+  }
+}
 
 const GAMES=[
   {id:"nassau",name:"Nassau",icon:"🏆"},{id:"wolf",name:"Wolf",icon:"🐺"},
@@ -101,10 +155,20 @@ export default function HammerApp() {
   const [sbEdit, setSbEdit] = useState(null);
   const [anim, setAnim] = useState(true);
   const [learnOpen, setLearnOpen] = useState(null);
+  const [holes, setHoles] = useState(DEFAULT_HOLES);
+  const [courseName, setCourseName] = useState("Augusta National");
+  const [courseSearch, setCourseSearch] = useState("");
+  const [courseResults, setCourseResults] = useState([]);
+  const [courseLoading, setCourseLoading] = useState(false);
+  const [courseError, setCourseError] = useState("");
+  const [teeOptions, setTeeOptions] = useState([]);
+  const [selectedTee, setSelectedTee] = useState(null);
+  const [courseCity, setCourseCity] = useState("");
   const mapRef = useRef(null);
+  const searchTimer = useRef(null);
 
   const C = dark ? DARK : LIGHT;
-  const hole = HOLES[curHole - 1];
+  const hole = holes[curHole - 1];
 
   useEffect(() => {
     setAnim(false);
@@ -118,9 +182,70 @@ export default function HammerApp() {
   const fdd = (d) => ({...fd, transitionDelay: d + "s"});
 
   const totalScore = (pid) => scores[pid].filter(s => s !== null).reduce((a, b) => a + b, 0);
-  const totalPar = (pid) => { let p = 0; scores[pid].forEach((s, i) => { if (s !== null) p += HOLES[i].par; }); return p; };
+  const totalPar = (pid) => { let p = 0; scores[pid].forEach((s, i) => { if (s !== null) p += holes[i].par; }); return p; };
   const toPar = (pid) => { const t = totalScore(pid); if (t === 0) return "E"; const d = t - totalPar(pid); return d > 0 ? "+" + d : d === 0 ? "E" : "" + d; };
   const holesPlayed = (pid) => scores[pid].filter(s => s !== null).length;
+
+  // Course search function
+  const searchCourses = async (query) => {
+    if (!query || query.length < 3) { setCourseResults([]); return; }
+    setCourseLoading(true);
+    setCourseError("");
+    try {
+      const res = await fetch(`/api/courses?q=${encodeURIComponent(query)}`);
+      if (!res.ok) throw new Error("API error");
+      const data = await res.json();
+      setCourseResults(data.courses || []);
+      if ((data.courses || []).length === 0) setCourseError("No courses found. Try a different name.");
+    } catch (e) {
+      setCourseError("Course search not available. Sign up at golfcourseapi.com and add your API key.");
+      setCourseResults([]);
+    }
+    setCourseLoading(false);
+  };
+
+  const handleCourseSearch = (val) => {
+    setCourseSearch(val);
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => searchCourses(val), 500);
+  };
+
+  const selectCourse = (course) => {
+    const parsed = parseCourseData(course);
+    if (parsed) {
+      setCourseName(parsed.name);
+      setTeeOptions(parsed.tees);
+      if (parsed.tees.length > 0) {
+        // Auto-select first tee with reasonable yardage
+        const defaultTee = parsed.tees.find(t => t.total > 5000) || parsed.tees[0];
+        setSelectedTee(defaultTee);
+        const updated = parsed.holes.map((h, i) => ({...h, yds: defaultTee.yardages[i] || 0}));
+        setHoles(updated);
+      } else {
+        setHoles(parsed.holes);
+        setSelectedTee(null);
+      }
+    } else {
+      setCourseError("Could not load scorecard data for this course.");
+    }
+    setCourseResults([]);
+    setCourseSearch("");
+  };
+
+  const selectTee = (tee) => {
+    setSelectedTee(tee);
+    setHoles(prev => prev.map((h, i) => ({...h, yds: tee.yardages[i] || 0})));
+  };
+
+  const resetToDefault = () => {
+    setHoles(DEFAULT_HOLES);
+    setCourseName("Augusta National");
+    setTeeOptions([]);
+    setSelectedTee(null);
+    setCourseSearch("");
+    setCourseResults([]);
+    setCourseError("");
+  };
 
   const handleMapTap = (e) => {
     if (!showShot || !selClub || !mapRef.current) return;
@@ -171,7 +296,7 @@ export default function HammerApp() {
           <div style={{width:52, height:52, borderRadius:26, background:"linear-gradient(135deg, " + C.yellow + ", " + C.gold + ")", display:"flex", alignItems:"center", justifyContent:"center", fontSize:24, fontWeight:800, color:C.green}}>C</div>
           <div>
             <div style={{fontFamily:"Georgia, serif", fontSize:22, fontWeight:700}}>Christo</div>
-            <div style={{fontSize:12, color:"rgba(255,255,255,0.5)", fontStyle:"italic"}}>Sugar Tree Golf Club</div>
+            <div style={{fontSize:12, color:"rgba(255,255,255,0.5)", fontStyle:"italic"}}>{courseName}</div>
           </div>
           <div style={{marginLeft:"auto", textAlign:"right"}}>
             <div style={{...itag, color:"rgba(255,255,255,0.4)"}}>Current Rank</div>
@@ -223,10 +348,81 @@ export default function HammerApp() {
     <div>
       <div style={{padding:"20px 20px 8px"}}>
         <div style={{fontFamily:"Georgia, serif", fontSize:28, fontWeight:700, color:C.text, fontStyle:"italic", ...fd}}>Round Setup</div>
-        <div style={{fontSize:13, color:C.textMuted, fontStyle:"italic", ...fdd(0.03)}}>Sugar Tree Golf Club · 18 Holes</div>
+        <div style={{fontSize:13, color:C.textMuted, fontStyle:"italic", ...fdd(0.03)}}>{courseName} · {holes.length} Holes</div>
       </div>
 
-      <div style={{...card, ...fdd(0.06)}}>
+      {/* ──── COURSE SEARCH ──── */}
+      <div style={{...card, ...fdd(0.04)}}>
+        <div style={{...itag, marginBottom:10}}>Golf Course</div>
+        <div style={{display:"flex", alignItems:"center", gap:8, marginBottom:10}}>
+          <div style={{flex:1, position:"relative"}}>
+            <input
+              type="text"
+              value={courseSearch}
+              onChange={(e) => handleCourseSearch(e.target.value)}
+              placeholder="Search courses (e.g. Sugar Tree)..."
+              style={{width:"100%", padding:"12px 14px", borderRadius:12, border:"1.5px solid " + C.border, background:C.surfaceAlt, fontSize:14, color:C.text, outline:"none", boxSizing:"border-box", fontFamily:"inherit"}}
+            />
+            {courseLoading && <div style={{position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", fontSize:12, color:C.textMuted}}>...</div>}
+          </div>
+        </div>
+
+        {/* Search results */}
+        {courseResults.length > 0 && (
+          <div style={{maxHeight:240, overflowY:"auto", borderRadius:12, border:"1px solid " + C.border, marginBottom:10}}>
+            {courseResults.map((c, i) => (
+              <div key={i} onClick={() => selectCourse(c)} style={{padding:"12px 14px", borderBottom:i < courseResults.length - 1 ? "1px solid " + C.surfaceAlt : "none", cursor:"pointer", background:C.surface, transition:"background 0.15s"}}
+                onMouseEnter={(e) => e.currentTarget.style.background = C.surfaceAlt}
+                onMouseLeave={(e) => e.currentTarget.style.background = C.surface}>
+                <div style={{fontSize:14, fontWeight:700, color:C.text}}>{c.courseName || c.name}</div>
+                <div style={{fontSize:11, color:C.textMuted, fontStyle:"italic", marginTop:2}}>
+                  {[c.city, c.state, c.country].filter(Boolean).join(", ")} {c.holes ? `· ${c.holes} holes` : ""}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {courseError && <div style={{fontSize:12, color:C.red, fontStyle:"italic", marginBottom:8}}>{courseError}</div>}
+
+        {/* Selected course display */}
+        <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 14px", borderRadius:12, background:C.greenLight, border:"1px solid " + (dark ? "#2A4D3A" : "#B2D8C4")}}>
+          <div>
+            <div style={{fontSize:14, fontWeight:700, color:C.birdie}}>⛳ {courseName}</div>
+            {selectedTee && <div style={{fontSize:11, color:C.textMuted, marginTop:2}}>{selectedTee.name} tees · {selectedTee.total.toLocaleString()} yds</div>}
+            {!selectedTee && <div style={{fontSize:11, color:C.textMuted, marginTop:2}}>Par {holes.reduce((a, h) => a + h.par, 0)} · {holes.reduce((a, h) => a + h.yds, 0).toLocaleString()} yds</div>}
+          </div>
+          {courseName !== "Augusta National" && (
+            <div onClick={resetToDefault} style={{fontSize:11, color:C.textMuted, cursor:"pointer", textDecoration:"underline"}}>Reset</div>
+          )}
+        </div>
+
+        {/* Tee box selector */}
+        {teeOptions.length > 1 && (
+          <div style={{marginTop:12}}>
+            <div style={{fontSize:11, fontWeight:700, color:C.textMuted, textTransform:"uppercase", letterSpacing:1, marginBottom:8}}>Tee Box</div>
+            <div style={{display:"flex", gap:6, flexWrap:"wrap"}}>
+              {teeOptions.map((tee, i) => {
+                const isActive = selectedTee && selectedTee.name === tee.name;
+                const teeColor = tee.name.toLowerCase().includes("blue") ? "#2563EB" :
+                  tee.name.toLowerCase().includes("white") ? "#9CA3AF" :
+                  tee.name.toLowerCase().includes("red") ? "#DC2626" :
+                  tee.name.toLowerCase().includes("gold") ? "#D97706" :
+                  tee.name.toLowerCase().includes("black") ? "#1F2937" :
+                  tee.name.toLowerCase().includes("green") ? "#16A34A" : C.green;
+                return (
+                  <div key={i} onClick={() => selectTee(tee)} style={{padding:"8px 14px", borderRadius:10, fontSize:12, fontWeight:700, background:isActive ? teeColor : C.surfaceAlt, color:isActive ? "#fff" : C.text, border:isActive ? "2px solid " + teeColor : "1px solid " + C.border, cursor:"pointer", textAlign:"center", minWidth:60}}>
+                    <div>{tee.name}</div>
+                    <div style={{fontSize:10, fontWeight:500, opacity:0.8, marginTop:2}}>{tee.total.toLocaleString()} yds</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{...card, ...fdd(0.08)}}>
         <div style={{...itag, marginBottom:14}}>Players</div>
         {PLAYERS.map(p => (
           <div key={p.id} style={{display:"flex", alignItems:"center", gap:12, padding:"10px 0", borderBottom:"1px solid " + C.surfaceAlt}}>
@@ -493,13 +689,13 @@ export default function HammerApp() {
           <div style={{minWidth:560, padding:14}}>
             <div style={{display:"flex", borderBottom:"2px solid " + C.border, paddingBottom:6, marginBottom:6}}>
               <div style={{width:60, ...itag}}>Hole</div>
-              {HOLES.slice(0, 9).map(h => <div key={h.num} style={{flex:1, textAlign:"center", ...itag}}>{h.num}</div>)}
+              {holes.slice(0, 9).map(h => <div key={h.num} style={{flex:1, textAlign:"center", ...itag}}>{h.num}</div>)}
               <div style={{width:36, textAlign:"center", fontSize:11, fontWeight:800, color:C.text}}>OUT</div>
             </div>
             <div style={{display:"flex", borderBottom:"1px solid " + C.surfaceAlt, paddingBottom:4, marginBottom:4}}>
               <div style={{width:60, ...itag}}>Par</div>
-              {HOLES.slice(0, 9).map(h => <div key={h.num} style={{flex:1, textAlign:"center", fontSize:12, fontWeight:600, color:C.textMuted}}>{h.par}</div>)}
-              <div style={{width:36, textAlign:"center", fontSize:12, fontWeight:800, color:C.text}}>{HOLES.slice(0, 9).reduce((a, h) => a + h.par, 0)}</div>
+              {holes.slice(0, 9).map(h => <div key={h.num} style={{flex:1, textAlign:"center", fontSize:12, fontWeight:600, color:C.textMuted}}>{h.par}</div>)}
+              <div style={{width:36, textAlign:"center", fontSize:12, fontWeight:800, color:C.text}}>{holes.slice(0, 9).reduce((a, h) => a + h.par, 0)}</div>
             </div>
             {PLAYERS.map(p => (
               <div key={p.id} style={{display:"flex", alignItems:"center", paddingBottom:4, marginBottom:4}}>
@@ -507,7 +703,7 @@ export default function HammerApp() {
                   <div style={avs(p.col, 18)}><span style={{fontSize:8}}>{p.av}</span></div>
                   <span style={{fontSize:11, fontWeight:600, color:C.text}}>{p.name.slice(0, 5)}</span>
                 </div>
-                {HOLES.slice(0, 9).map(h => {
+                {holes.slice(0, 9).map(h => {
                   const s = scores[p.id][h.num - 1];
                   const d = s ? s - h.par : null;
                   return (
@@ -541,8 +737,8 @@ export default function HammerApp() {
       back9[p.id] = scores[p.id].slice(9, 18).filter(Boolean).reduce((a, b) => a + b, 0);
       overall[p.id] = totalScore(p.id);
     });
-    const front9Par = HOLES.slice(0, 9).reduce((a, h) => a + h.par, 0);
-    const back9Par = HOLES.slice(9, 18).reduce((a, h) => a + h.par, 0);
+    const front9Par = holes.slice(0, 9).reduce((a, h) => a + h.par, 0);
+    const back9Par = holes.slice(9, 18).reduce((a, h) => a + h.par, 0);
     const front9Played = Math.max(...PLAYERS.map(p => scores[p.id].slice(0, 9).filter(Boolean).length));
     const back9Played = Math.max(...PLAYERS.map(p => scores[p.id].slice(9, 18).filter(Boolean).length));
 
